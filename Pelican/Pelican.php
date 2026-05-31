@@ -3,8 +3,9 @@
 namespace Paymenter\Extensions\Servers\Pelican;
 
 use App\Classes\Extension\Server;
-use App\Models\Service;
 use App\Models\Product;
+use App\Models\Service;
+use Exception;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\HtmlString;
 use Illuminate\Support\Str;
@@ -21,7 +22,6 @@ class Pelican extends Server
                 'name' => 'host',
                 'label' => 'Pelican URL',
                 'type' => 'text',
-                'default' => 'https://example.com/',
                 'description' => 'Pelican URL',
                 'required' => true,
                 'validation' => 'url',
@@ -30,8 +30,7 @@ class Pelican extends Server
                 'name' => 'api_key',
                 'label' => 'Pelican API Key',
                 'type' => 'text',
-                'default' => 'peli_abcdefgh12345678',
-                'description' => 'Pelican API Key',
+                'description' => 'Pelican Application API key',
                 'required' => true,
                 'encrypted' => true,
             ],
@@ -42,7 +41,7 @@ class Pelican extends Server
     {
         try {
             $this->request('/api/application/servers', 'GET');
-        } catch (\Exception $e) {
+        } catch (Exception $e) {
             return $e->getMessage();
         }
 
@@ -51,15 +50,22 @@ class Pelican extends Server
 
     public function request($url, $method = 'get', $data = []): array
     {
-        // Trim any leading slashes from the base url and add the path URL to it
-        $req_url = rtrim($this->config('host'), '/') . $url;
-        $response = Http::withHeaders([
-            'Authorization' => 'Bearer ' . $this->config('api_key'),
-            'Accept' => 'application/json',
-        ])->$method($req_url, $data);
+        $method = strtolower($method);
+        $requestUrl = rtrim($this->config('host'), '/') . '/' . ltrim($url, '/');
+        $response = Http::withToken($this->config('api_key'))
+            ->acceptJson()
+            ->asJson()
+            ->timeout(30)
+            ->$method($requestUrl, $data);
 
         if (!$response->successful()) {
-            throw new \Exception($response->json()['errors'][0]['detail']);
+            $body = $response->json();
+            $message = is_array($body)
+                ? ($body['errors'][0]['detail'] ?? $body['errors'][0]['message'] ?? $body['message'] ?? null)
+                : null;
+            $message ??= $response->body() ?: 'Unknown Pelican API error';
+
+            throw new Exception("Pelican API {$response->status()} {$method} {$url}: {$message}", $response->status());
         }
 
         return $response->json() ?? [];
@@ -67,7 +73,7 @@ class Pelican extends Server
 
     public function getProductConfig($values = []): array
     {
-        $nodes = $this->request('/api/application/nodes');
+        $nodes = $this->request('/api/application/nodes', 'get', ['per_page' => 500]);
         $nodeList = [];
         foreach ($nodes['data'] as $node) {
             $nodeList[$node['attributes']['id']] = $node['attributes']['name'];
@@ -86,8 +92,16 @@ class Pelican extends Server
                 'name' => 'node',
                 'label' => 'Node',
                 'type' => 'select',
-                'description' => 'Fill in to install the server on a specific node',
+                'description' => 'Leave empty to let Pelican auto deploy using tags and port ranges.',
                 'options' => $nodeList,
+            ],
+            [
+                'name' => 'deployment_tags',
+                'label' => 'Deployment Tags',
+                'type' => 'tags',
+                'description' => 'Optional Pelican node tags to restrict automatic deployment.',
+                'database_type' => 'array',
+                'required' => false,
             ],
             [
                 'name' => 'egg_id',
@@ -103,14 +117,17 @@ class Pelican extends Server
                 'suffix' => 'MiB',
                 'required' => true,
                 'validation' => 'numeric',
+                'min_value' => 0,
+                'description' => 'Set to 0 for unlimited',
             ],
             [
                 'name' => 'swap',
                 'label' => 'Swap',
                 'type' => 'number',
-                'min_value' => 0,
+                'min_value' => -1,
                 'suffix' => 'MiB',
                 'required' => true,
+                'description' => 'Set to -1 for unlimited, or to 0 to disable swap',
             ],
             [
                 'name' => 'disk',
@@ -118,6 +135,8 @@ class Pelican extends Server
                 'type' => 'number',
                 'suffix' => 'MiB',
                 'required' => true,
+                'min_value' => 0,
+                'description' => 'Set to 0 for unlimited',
             ],
             [
                 'name' => 'io',
@@ -137,11 +156,20 @@ class Pelican extends Server
                 'required' => true,
                 'min_value' => 0,
                 'suffix' => '%',
+                'description' => 'Set to 0 for unlimited',
             ],
             [
                 'name' => 'cpu_pinning',
                 'label' => 'CPU Pinning',
                 'type' => 'text',
+                'description' => 'Leave empty for no pinning. Example: 0,2-4,5,6',
+                'validation' => 'nullable|regex:/^[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*$/',
+            ],
+            [
+                'name' => 'docker_image',
+                'label' => 'Docker Image Override',
+                'type' => 'text',
+                'description' => 'Optional. Leave empty to use the selected egg default image.',
             ],
             [
                 'name' => 'databases',
@@ -169,7 +197,7 @@ class Pelican extends Server
                 'label' => 'Port Array',
                 'type' => 'text',
                 'description' => 'Used to assign ports to egg variables.',
-                'hint' => new HtmlString('<a href="https://paymenter.org/docs/extensions/pterodactyl#port-array" target="_blank">Documentation</a>'),
+                'hint' => new HtmlString('<a href="https://github.com/Gvolexe/PelicanExtentionPaymenter#port-array" target="_blank">Documentation</a>'),
                 'live' => true,
                 'validation' => 'json',
             ],
@@ -210,24 +238,68 @@ class Pelican extends Server
         ];
     }
 
+    public function getCheckoutConfig(Product $product, $values = [], $settings = []): array
+    {
+        if (empty($settings['egg_id'])) {
+            return [];
+        }
+
+        try {
+            $eggData = $this->getEggWithVariables((int) $settings['egg_id']);
+        } catch (Exception) {
+            return [];
+        }
+
+        $fields = [];
+        foreach ($this->eggVariables($eggData) as $variable) {
+            $attributes = $variable['attributes'];
+            if (!($attributes['user_editable'] ?? false)) {
+                continue;
+            }
+
+            $rules = (array) ($attributes['rules'] ?? []);
+            $field = [
+                'name' => $attributes['env_variable'],
+                'label' => $attributes['name'],
+                'type' => $this->fieldTypeFromRules($rules),
+                'default' => $attributes['default_value'] ?? '',
+                'description' => $attributes['description'] ?? '',
+                'required' => in_array('required', $rules, true),
+            ];
+
+            $validation = implode('|', array_filter($rules, fn ($rule) => $rule !== 'required'));
+            if ($validation !== '') {
+                $field['validation'] = $validation;
+            }
+
+            $fields[] = $field;
+        }
+
+        return $fields;
+    }
+
     public function createServer(Service $service, $settings, $properties)
     {
         if ($this->getServer($service->id, failIfNotFound: false)) {
-            throw new \Exception('Server already exists');
+            throw new Exception('Server already exists');
         }
-        // Smash the properties into the settings
+
         $settings = array_merge($settings, $properties);
 
-        $eggData = $this->request('/api/application/eggs/' . $settings['egg_id'], data: ['include' => 'variables']);
+        $eggData = $this->getEggWithVariables((int) $settings['egg_id']);
         if (!isset($eggData['attributes'])) {
-            throw new \Exception('Could not fetch egg data');
+            throw new Exception('Could not fetch egg data');
         }
         $environment = [];
-        foreach ($eggData['attributes']['relationships']['variables']['data'] as $variable) {
+        foreach ($this->eggVariables($eggData) as $variable) {
             $environment[$variable['attributes']['env_variable']] = $settings[$variable['attributes']['env_variable']] ?? $variable['attributes']['default_value'];
         }
 
-        $orderUser = $service->order->user;
+        $orderUser = $service->user ?? $service->order?->user;
+        if (!$orderUser) {
+            throw new Exception('Could not determine the Paymenter user for this service');
+        }
+
         // Get the user id if one already exists...
         $user = $this->request('/api/application/users', 'get', ['filter' => ['email' => $orderUser->email]])['data'][0]['attributes']['id'] ?? null;
 
@@ -235,12 +307,9 @@ class Pelican extends Server
         if (!$user) {
             $user = $this->request('/api/application/users', 'post', [
                 'email' => $orderUser->email,
-                'username' => (preg_replace('/[^a-zA-Z0-9]/', '', strtolower($orderUser->name)) ?? Str::random(8)) . '_' . Str::random(4),
-                'first_name' => $orderUser->first_name ?? '',
-                'last_name' => $orderUser->last_name ?? '',
+                'username' => $this->makeUsername($orderUser->name ?? $orderUser->email),
+                'is_managed_externally' => true,
             ])['attributes']['id'];
-
-            $returnData['created_user'] = true;
         }
 
         $deploymentData = $this->generateDeploymentData($settings, $environment);
@@ -250,11 +319,11 @@ class Pelican extends Server
             'name' => isset($settings['servername']) ? $settings['servername'] : $service->product->name . ' #' . $service->id,
             'user' => (int) $user,
             'egg' => $settings['egg_id'],
-            'docker_image' => $eggData['attributes']['docker_image'],
+            'docker_image' => ($settings['docker_image'] ?? null) ?: $eggData['attributes']['docker_image'],
             'startup' => $eggData['attributes']['startup'],
             'environment' => $deploymentData['environment'],
-            'skip_scripts' => $settings['skip_scripts'] ?? false,
-            'oom_disabled' => !($settings['oom_killer'] ?? false),
+            'skip_scripts' => (bool) ($settings['skip_scripts'] ?? false),
+            'oom_killer' => (bool) ($settings['oom_killer'] ?? false),
             'limits' => [
                 'memory' => (int) $settings['memory'],
                 'swap' => (int) $settings['swap'],
@@ -264,21 +333,17 @@ class Pelican extends Server
                 'cpu' => (int) $settings['cpu'],
             ],
             'feature_limits' => [
-                'databases' => $settings['databases'],
-                'allocations' => $deploymentData['allocations_needed'] + $settings['additional_allocations'],
-                'backups' => $settings['backups'],
+                'databases' => (int) $settings['databases'],
+                'allocations' => $deploymentData['allocations_needed'] + (int) $settings['additional_allocations'],
+                'backups' => (int) $settings['backups'],
             ],
-            'allocation' => [
-                'default' => $deploymentData['allocations_needed'] + $settings['additional_allocations'],
-            ],
-            'start_on_completion' => $settings['start_on_completion'] ?? false,
+            'start_on_completion' => (bool) ($settings['start_on_completion'] ?? false),
         ];
         if ($deploymentData['auto_deploy']) {
             $serverCreationData['deploy'] = [
-                'locations' => [$settings['node']] ?? [],
-                'dedicated_ip' => $settings['dedicated_ip'] ?? false,
+                'tags' => $this->normalizeArray($settings['deployment_tags'] ?? []),
+                'dedicated_ip' => (bool) ($settings['dedicated_ip'] ?? false),
                 'port_range' => $settings['port_range'] ?? [],
-                'tags' => ['PaymenterDeployment'],
             ];
         } else {
             $serverCreationData['allocation'] = $deploymentData['allocation'];
@@ -295,6 +360,21 @@ class Pelican extends Server
     private function generateDeploymentData($settings, $environment)
     {
         if (!isset($settings['port_array']) || $settings['port_array'] === '') {
+            if (!empty($settings['node']) || empty($this->normalizeArray($settings['port_range'] ?? []))) {
+                $allocation = $this->getFirstAvailableAllocation($settings);
+                $environment['SERVER_PORT'] = $allocation['port'];
+
+                return [
+                    'auto_deploy' => false,
+                    'environment' => $environment,
+                    'allocations_needed' => 1,
+                    'allocation' => [
+                        'default' => $allocation['id'],
+                        'additional' => [],
+                    ],
+                ];
+            }
+
             return [
                 'auto_deploy' => true,
                 'environment' => $environment,
@@ -306,69 +386,56 @@ class Pelican extends Server
             // Example: {"SERVER_PORT": 7777, "NONE": [7778, 7779], "QUERY_PORT": 2701, "RCON_PORT": 27020}
             $port_array = json_decode($settings['port_array'], true);
             if (json_last_error() !== JSON_ERROR_NONE) {
-                throw new \Exception('JSON decode error: ' . json_last_error_msg());
+                throw new Exception('JSON decode error: ' . json_last_error_msg());
             }
-        } catch (\Exception $e) {
-            throw new \Exception('Invalid JSON in port array');
+        } catch (Exception) {
+            throw new Exception('Invalid JSON in port array');
         }
 
         if (!is_array($port_array)) {
-            throw new \Exception('Port array must be an array');
+            throw new Exception('Port array must be an object');
         }
 
+        if (!array_key_exists('SERVER_PORT', $port_array)) {
+            throw new Exception('Port array must include a SERVER_PORT entry');
+        }
+
+        $port_array = $this->normalizePortArray($port_array);
+        $free_allocations_needed = $this->countRequiredAllocations($port_array);
         $nodes = $this->request('/api/application/nodes/deployable', 'get', [
             'memory' => $settings['memory'],
             'disk' => $settings['disk'],
+            'cpu' => $settings['cpu'] ?? 0,
+            'tags' => $this->normalizeArray($settings['deployment_tags'] ?? []),
+            'include' => ['allocations'],
         ]);
         $nodes = collect($nodes['data']);
         $nodes_by_id = $nodes->mapWithKeys(fn ($node) => [$node['attributes']['id'] => $node['attributes']]);
 
-        if ($settings['node']) {
+        if (!empty($settings['node'])) {
             // If the product's node id is not in the deployable nodes array, throw error.
             if (!$nodes_by_id->has($settings['node'])) {
-                throw new \Exception('Node is not suitable for deployment.');
+                throw new Exception('Node is not suitable for deployment.');
             }
 
             $node = $nodes_by_id->get($settings['node']);
-            $availablePorts = collect($node['relationships']['allocations']['data']);
-            $availablePorts = $availablePorts
-                ->filter(fn ($port) => !$port['attributes']['assigned'])
-                ->map(
-                    fn ($port) => [
-                        'port' => $port['attributes']['port'],
-                        'id' => $port['attributes']['id'],
-                    ]
-                );
-
-            $free_allocations_needed = 0;
-            foreach ($port_array as $key => $value) {
-                $free_allocations_needed += is_array($value) ? count($value) : 1;
-            }
+            $availablePorts = $this->availableAllocationsForNode($node);
 
             if (count($availablePorts) < $free_allocations_needed) {
-                throw new \Exception("Not enough allocations found for deployment. Found: {$availablePorts->count()}, Required: {$free_allocations_needed}");
+                throw new Exception("Not enough allocations found for deployment. Found: {$availablePorts->count()}, Required: {$free_allocations_needed}");
             }
         } else {
-            foreach ($nodes as $index => $node) {
-                $availablePorts = collect($node['attributes']['relationships']['allocations']['data']);
-                $availablePorts = $availablePorts
-                    ->filter(fn ($port) => !$port['attributes']['assigned'])
-                    ->map(
-                        fn ($port) => [
-                            'port' => $port['attributes']['port'],
-                            'id' => $port['attributes']['id'],
-                        ]
-                    );
+            if ($nodes->isEmpty()) {
+                throw new Exception('No deployable nodes found for the configured limits and tags');
+            }
 
-                $free_allocations_needed = 0;
-                foreach ($port_array as $key => $value) {
-                    $free_allocations_needed += is_array($value) ? count($value) : 1;
-                }
+            foreach ($nodes as $index => $node) {
+                $availablePorts = $this->availableAllocationsForNode($node['attributes']);
 
                 if (count($availablePorts) < $free_allocations_needed) {
                     // If this was last viable node, throw error
                     if ($index == $nodes->count() - 1) {
-                        throw new \Exception('No nodes with suitable allocations found for deployment');
+                        throw new Exception('No nodes with suitable allocations found for deployment');
                     }
 
                     // Else move onto next viable node
@@ -381,18 +448,12 @@ class Pelican extends Server
         $allocations = [];
         foreach ($port_array as $key => $value) {
             if (is_array($value)) {
+                if ($key !== 'NONE') {
+                    throw new Exception('Only the NONE port array entry can contain multiple ports');
+                }
+
                 foreach ($value as $port) {
-                    $allocation = $availablePorts->where('port', $port)->first();
-                    if (!$allocation) {
-                        // try to assign a higher port, if that fails try a random port
-                        $allocation = $availablePorts->where('port', '>', $port)->first();
-                        if (!$allocation) {
-                            $allocation = $availablePorts->random();
-                        }
-                        if (!$allocation) {
-                            throw new \Exception('Could not find a port to assign');
-                        }
-                    }
+                    $allocation = $this->findClosestAllocation($availablePorts, $port);
                     $allocations[$key][] = $allocation;
 
                     // Remove the port from the available ports
@@ -401,17 +462,7 @@ class Pelican extends Server
                     });
                 }
             } else {
-                $allocation = $availablePorts->where('port', $value)->first();
-                if (!$allocation) {
-                    // try to assign a higher port, if that fails try a random port
-                    $allocation = $availablePorts->where('port', '>', $value)->first();
-                    if (!$allocation) {
-                        $allocation = $availablePorts->random();
-                    }
-                    if (!$allocation) {
-                        throw new \Exception('Could not find a port to assign');
-                    }
-                }
+                $allocation = $this->findClosestAllocation($availablePorts, $value);
                 $allocations[$key] = $allocation;
 
                 // Remove the port from the available ports
@@ -458,12 +509,16 @@ class Pelican extends Server
     {
         try {
             $response = $this->request('/api/application/servers/external/' . $id);
-        } catch (\Exception $e) {
-            if ($failIfNotFound) {
-                throw new \Exception('Server not found');
-            } else {
+        } catch (Exception $e) {
+            if (!$failIfNotFound && (int) $e->getCode() === 404) {
                 return false;
             }
+
+            if ($failIfNotFound && (int) $e->getCode() === 404) {
+                throw new Exception('Server not found', 404, $e);
+            }
+
+            throw $e;
         }
         if ($raw) {
             return $response;
@@ -504,33 +559,37 @@ class Pelican extends Server
         $server = $this->getServer($service->id, raw: true);
 
         $settings = array_merge($settings, $properties);
+        $allocationLimit = $this->countRequiredAllocationsFromSettings($settings) + (int) $settings['additional_allocations'];
 
         $updateServerData = [
             'allocation' => $server['attributes']['allocation'],
-            'memory' => (int) $settings['memory'],
-            'swap' => (int) $settings['swap'],
-            'disk' => (int) $settings['disk'],
-            'io' => (int) $settings['io'],
-            'cpu' => (int) $settings['cpu'],
-            'threads' => $settings['cpu_pinning'] ?? null,
+            'oom_killer' => (bool) ($settings['oom_killer'] ?? false),
+            'limits' => [
+                'memory' => (int) $settings['memory'],
+                'swap' => (int) $settings['swap'],
+                'disk' => (int) $settings['disk'],
+                'io' => (int) $settings['io'],
+                'cpu' => (int) $settings['cpu'],
+                'threads' => $settings['cpu_pinning'] ?? null,
+            ],
             'feature_limits' => [
-                'databases' => $settings['databases'],
-                'allocations' => $settings['additional_allocations'],
-                'backups' => $settings['backups'],
+                'databases' => (int) $settings['databases'],
+                'allocations' => max($allocationLimit, (int) ($server['attributes']['feature_limits']['allocations'] ?? 0)),
+                'backups' => (int) $settings['backups'],
             ],
         ];
 
         $this->request('/api/application/servers/' . $server['attributes']['id'] . '/build', 'patch', $updateServerData);
 
-        $eggData = $this->request('/api/application/eggs/' . $settings['egg_id'], data: ['include' => 'variables']);
+        $eggData = $this->getEggWithVariables((int) $settings['egg_id']);
 
         if (!isset($eggData['attributes'])) {
-            throw new \Exception('Could not fetch egg data');
+            throw new Exception('Could not fetch egg data');
         }
 
         $environment = [];
 
-        foreach ($eggData['attributes']['relationships']['variables']['data'] as $variable) {
+        foreach ($this->eggVariables($eggData) as $variable) {
             // Check if variable has been set on server
             if (isset($server['attributes']['container']['environment'][$variable['attributes']['env_variable']])) {
                 $environment[$variable['attributes']['env_variable']] = $server['attributes']['container']['environment'][$variable['attributes']['env_variable']];
@@ -541,10 +600,9 @@ class Pelican extends Server
 
         $updateServerData = [
             'environment' => $environment,
-            'skip_scripts' => $settings['skip_scripts'] ?? false,
-            'oom_disabled' => !($settings['oom_killer'] ?? false),
+            'skip_scripts' => (bool) ($settings['skip_scripts'] ?? false),
             'egg' => $settings['egg_id'],
-            'image' => $server['attributes']['container']['image'] ?? $eggData['attributes']['docker_image'],
+            'image' => ($settings['docker_image'] ?? null) ?: ($server['attributes']['container']['image'] ?? $eggData['attributes']['docker_image']),
             'startup' => $server['attributes']['container']['startup_command'] ?? $settings['startup'] ?? $eggData['attributes']['startup'],
         ];
 
@@ -570,9 +628,180 @@ class Pelican extends Server
     {
         return match ($key) {
             'egg' => ['key' => 'egg_id', 'value' => $value],
-            'allocation' => ['key' => 'allocation_additional', 'value' => $value],
-            'location' => ['key' => 'node_id', 'value' => $value, 'type' => 'array'],
+            'allocation' => ['key' => 'additional_allocations', 'value' => $value],
+            'location', 'node_id' => ['key' => 'node', 'value' => $value],
             default => ['key' => $key, 'value' => $value]
         };
+    }
+
+    private function getEggWithVariables(int $eggId): array
+    {
+        return $this->request('/api/application/eggs/' . $eggId, data: ['include' => 'variables']);
+    }
+
+    private function eggVariables(array $eggData): array
+    {
+        return $eggData['attributes']['relationships']['variables']['data'] ?? [];
+    }
+
+    private function makeUsername(?string $name): string
+    {
+        $base = preg_replace('/[^a-z0-9]/', '', strtolower(Str::transliterate($name ?: 'user'))) ?: 'user';
+
+        return substr($base, 0, 24) . '_' . strtolower(Str::random(6));
+    }
+
+    private function fieldTypeFromRules(array $rules): string
+    {
+        if (array_intersect($rules, ['integer', 'numeric'])) {
+            return 'number';
+        }
+
+        if (array_intersect($rules, ['boolean', 'bool'])) {
+            return 'checkbox';
+        }
+
+        return 'text';
+    }
+
+    private function normalizeArray($value): array
+    {
+        if (is_array($value)) {
+            return array_values(array_filter($value, fn ($item) => $item !== null && $item !== ''));
+        }
+
+        if ($value === null || $value === '') {
+            return [];
+        }
+
+        return [$value];
+    }
+
+    private function normalizePortArray(array $portArray): array
+    {
+        foreach ($portArray as $key => $value) {
+            if (is_array($value)) {
+                $portArray[$key] = array_map(fn ($port) => $this->normalizePort($port), $value);
+            } else {
+                $portArray[$key] = $this->normalizePort($value);
+            }
+        }
+
+        return $portArray;
+    }
+
+    private function normalizePort($port): int
+    {
+        if (!is_numeric($port) || (int) $port < 1 || (int) $port > 65535) {
+            throw new Exception('Port array entries must be valid TCP/UDP ports between 1 and 65535');
+        }
+
+        return (int) $port;
+    }
+
+    private function countRequiredAllocationsFromSettings(array $settings): int
+    {
+        if (empty($settings['port_array'])) {
+            return 1;
+        }
+
+        $portArray = json_decode($settings['port_array'], true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($portArray) || !array_key_exists('SERVER_PORT', $portArray)) {
+            throw new Exception('Invalid port array');
+        }
+
+        return $this->countRequiredAllocations($this->normalizePortArray($portArray));
+    }
+
+    private function countRequiredAllocations(array $portArray): int
+    {
+        return collect($portArray)->sum(fn ($value) => is_array($value) ? count($value) : 1);
+    }
+
+    private function getFirstAvailableAllocation(array $settings): array
+    {
+        $nodes = $this->request('/api/application/nodes/deployable', 'get', [
+            'memory' => $settings['memory'],
+            'disk' => $settings['disk'],
+            'cpu' => $settings['cpu'] ?? 0,
+            'tags' => $this->normalizeArray($settings['deployment_tags'] ?? []),
+            'include' => ['allocations'],
+        ]);
+        $nodes = collect($nodes['data'])->pluck('attributes');
+
+        if (!empty($settings['node'])) {
+            $nodes = $nodes->where('id', $settings['node']);
+        }
+
+        if ($nodes->isEmpty()) {
+            throw new Exception('Node is not suitable for deployment.');
+        }
+
+        $portRanges = $this->normalizeArray($settings['port_range'] ?? []);
+        foreach ($nodes as $node) {
+            $availablePorts = $this->availableAllocationsForNode($node, (bool) ($settings['dedicated_ip'] ?? false))
+                ->filter(fn ($allocation) => $this->portMatchesRanges($allocation['port'], $portRanges))
+                ->values();
+
+            if ($availablePorts->isNotEmpty()) {
+                return $availablePorts->first();
+            }
+        }
+
+        throw new Exception('No available allocations found for deployment.');
+    }
+
+    private function availableAllocationsForNode(array $node, bool $dedicated = false)
+    {
+        $allocations = collect($node['relationships']['allocations']['data'] ?? []);
+        $assignedIps = $allocations
+            ->filter(fn ($allocation) => $allocation['attributes']['assigned'] ?? false)
+            ->pluck('attributes.ip')
+            ->unique();
+
+        return $allocations
+            ->filter(fn ($allocation) => !($allocation['attributes']['assigned'] ?? true))
+            ->filter(fn ($allocation) => !$dedicated || !$assignedIps->contains($allocation['attributes']['ip'] ?? null))
+            ->map(fn ($allocation) => [
+                'port' => (int) $allocation['attributes']['port'],
+                'id' => (int) $allocation['attributes']['id'],
+                'ip' => $allocation['attributes']['ip'] ?? null,
+            ])
+            ->sortBy('port')
+            ->values();
+    }
+
+    private function portMatchesRanges(int $port, array $ranges): bool
+    {
+        if (empty($ranges)) {
+            return true;
+        }
+
+        foreach ($ranges as $range) {
+            if (is_numeric($range) && $port === (int) $range) {
+                return true;
+            }
+
+            if (is_string($range) && preg_match('/^(\d+)-(\d+)$/', $range, $matches)) {
+                if ($port >= (int) $matches[1] && $port <= (int) $matches[2]) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private function findClosestAllocation($availablePorts, int $requestedPort): array
+    {
+        $allocation = $availablePorts->where('port', $requestedPort)->first()
+            ?? $availablePorts->first(fn ($allocation) => $allocation['port'] > $requestedPort)
+            ?? $availablePorts->first();
+
+        if (!$allocation) {
+            throw new Exception('Could not find a port to assign');
+        }
+
+        return $allocation;
     }
 }
